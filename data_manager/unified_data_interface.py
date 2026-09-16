@@ -3,7 +3,7 @@
 """
 统一数据接口
 实现DuckDB和QMT数据源的统一管理
-优先使用DuckDB本地数据，自动回退到QMT在线数据，并自动保存到DuckDB
+优先使用DuckDB本地数据，自动回退到统一在线数据源，并自动保存到DuckDB
 
 参考文档：docs/DUCKDB_COMPARISON_ANALYSIS.md
 """
@@ -27,26 +27,27 @@ class UnifiedDataInterface:
 
     功能：
     1. 优先从DuckDB读取原始数据
-    2. 如无数据或数据不全，使用QMT在线获取
+    2. 如无数据或数据不全，通过DataAPI使用当前可用的在线数据源
     3. 获取后自动保存到DuckDB
     4. 智能检测缺失数据
     5. 支持5种复权类型（通过QMT API按需获取，不预存复权列）
     """
 
-    def __init__(self, duckdb_path: str = None):
+    def __init__(self, duckdb_path: str = None, data_api=None):
         """
         初始化统一数据接口
 
         Args:
             duckdb_path: DuckDB数据库路径
+            data_api: 可选的DataAPI兼容实例，主要用于测试或显式注入
         """
         if duckdb_path is None:
             duckdb_path = get_default_db_path()
         self.duckdb_path = duckdb_path
         self.con = None
-        self.qmt_available = False
         self._tables_initialized = False  # 记录表是否已初始化
         self.db_manager = None  # 使用连接池管理器
+        self.data_api = data_api  # 延迟获取共享实例，初始化时不触发任何在线连接
 
         # 尝试导入DuckDB
         try:
@@ -57,47 +58,20 @@ class UnifiedDataInterface:
             self.duckdb_available = False
             logger.warning("[WARNING] DuckDB 不可用，将仅使用QMT数据")
 
-        # 尝试导入QMT
-        try:
-            from xtquant import xtdata
-            self.qmt_available = True
-            logger.info("[INFO] QMT xtdata 可用")
-        except ImportError:
-            self.qmt_available = False
-            logger.warning("[WARNING] QMT xtdata 不可用")
+    def _get_online_data_api(self):
+        """延迟取得进程级共享DataAPI，避免构造接口时产生连接副作用。"""
+        if self.data_api is None:
+            from easy_xt.api_runtime import get_shared_data_api
+            self.data_api = get_shared_data_api()
+        return self.data_api
 
-        # 自动恢复标记（避免无限重试）
-        self._qmt_recovery_attempted = False
-
-    def _ensure_qmt_alive(self) -> bool:
-        """确保 QMT 可用，不可用时自动启动并登录"""
-        if self.qmt_available:
-            # 探测是否真的能连通
-            try:
-                from xtquant import xtdata
-                xtdata.get_trading_dates('SH', '', '', count=1)
-                return True
-            except Exception:
-                self.qmt_available = False
-
-        # 已经尝试过恢复，不再重试
-        if self._qmt_recovery_attempted:
-            return False
-
-        self._qmt_recovery_attempted = True
-        logger.info("[INFO] QMT 未连接，尝试自动启动...")
-        try:
-            from core.auto_login import QMTAutoLogin
-            login = QMTAutoLogin()
-            if login.login(restart=False, timeout=60):
-                from xtquant import xtdata
-                self.qmt_available = True
-                logger.info("[OK] QMT 已自动恢复")
-                return True
-        except Exception as e:
-            logger.warning(f"[WARN] QMT 自动启动失败: {e}")
-
-        return False
+    def _ensure_online_source(self) -> bool:
+        """确保统一DataAPI已选出可用数据源。"""
+        api = self._get_online_data_api()
+        if getattr(api, '_active_source', None):
+            return True
+        connect = getattr(api, 'connect', None)
+        return bool(connect()) if callable(connect) else True
 
     def connect(self, read_only: bool = False):
         """
@@ -171,7 +145,7 @@ class UnifiedDataInterface:
 
         数据获取策略：
         1. 优先从DuckDB读取（包含五维复权，速度快）
-        2. 如DuckDB无数据或数据不全，使用QMT在线获取（当local_only=False时）
+        2. 如DuckDB无数据或数据不全，使用统一在线数据源获取（当local_only=False时）
         3. 获取后自动保存到DuckDB（当auto_save=True时）
 
         Args:
@@ -209,7 +183,14 @@ class UnifiedDataInterface:
                     self.adjustment_cache = AdjustmentCache(self.duckdb_path)
 
                 # 使用缓存管理器获取数据
-                if period == '1d':
+                if period == '1d' and adjust == 'none':
+                    data = self._read_from_duckdb(
+                        stock_code, start_date, end_date, period, adjust)
+                    if data is not None and not data.empty:
+                        logger.info(
+                            f"  [OK] 从统一DuckDB读取层获取成功 {len(data)} 条记录 "
+                            f"[股票:{stock_code}]")
+                elif period == '1d':
                     data = self.adjustment_cache.get_adjusted_data(
                         stock_code=stock_code,
                         start_date=start_date,
@@ -249,42 +230,46 @@ class UnifiedDataInterface:
                 logger.info(f"  → DuckDB 数据不完整（缺失 {missing_days} 个交易日），需要补充")
                 need_download = True
 
-        # Step 3: 如需下载，使用QMT获取（仅在local_only=False时）
+        # Step 3: 如需下载，通过共享DataAPI路由获取（仅在local_only=False时）
         if need_download:
             # 如果设置为只读取本地数据，则不进行在线获取
             if local_only:
                 logger.info(f"  [INFO] local_only=True，跳过在线获取，仅返回本地已有数据")
                 return data if data is not None else pd.DataFrame()
 
-            if not self.qmt_available and not self._ensure_qmt_alive():
-                logger.error(f"  [ERROR] QMT 不可用，无法获取在线数据")
+            if not self._ensure_online_source():
+                logger.error("  [ERROR] 没有可用的在线数据源")
                 return data if data is not None else pd.DataFrame()
 
-            logger.info(f"  → 从 QMT 获取在线数据...")
-            qmt_data = self._read_from_qmt(stock_code, start_date, end_date, period)
+            source = getattr(self.data_api, '_active_source', None) or 'injected'
+            logger.info(f"  → 从统一在线数据源获取（{source}）...")
+            online_data = self._read_from_online(
+                stock_code, start_date, end_date, period)
 
-            if qmt_data is None or qmt_data.empty:
-                logger.error(f"  [ERROR] QMT 数据获取失败")
+            if online_data is None or online_data.empty:
+                logger.error("  [ERROR] 在线数据获取失败")
                 return data if data is not None else pd.DataFrame()
 
-            logger.debug(f"  [DEBUG] QMT返回 {len(qmt_data)} 条记录")
+            logger.debug(f"  [DEBUG] 在线数据源返回 {len(online_data)} 条记录")
 
             # 合并数据（DuckDB有的就用，没有的补充）
             if data is not None and not data.empty:
-                logger.info(f"  → 合并 DuckDB 和 QMT 数据...")
-                logger.debug(f"  [DEBUG] 合并前 - DuckDB: {len(data)}条, QMT: {len(qmt_data)}条")
+                logger.info("  → 合并 DuckDB 和在线数据...")
+                logger.debug(
+                    f"  [DEBUG] 合并前 - DuckDB: {len(data)}条, "
+                    f"在线: {len(online_data)}条")
                 try:
-                    merged_data = self._merge_data(data, qmt_data)
+                    merged_data = self._merge_data(data, online_data)
                     logger.debug(f"  [DEBUG] 合并后: {len(merged_data)}条")
                     data = merged_data
                 except Exception as e:
                     logger.error(f"  [ERROR] 合并失败: {e}")
                     import traceback
                     traceback.print_exc()
-                    # 降级：只使用QMT数据
-                    data = qmt_data
+                    # 降级：只使用在线数据
+                    data = online_data
             else:
-                data = qmt_data
+                data = online_data
 
             # Step 4: 保存到DuckDB
             if auto_save and self.duckdb_available and self.con:
@@ -310,6 +295,16 @@ class UnifiedDataInterface:
     ) -> Optional[pd.DataFrame]:
         """从DuckDB读取数据 - 修复版（添加表存在性检查）"""
         try:
+            if period == '1d' and adjust == 'none':
+                from core.data_manager.local_price_reader import read_daily_prices
+                df = read_daily_prices(
+                    self.con, [stock_code], start_date, end_date, include_etf=True)
+                if df.empty:
+                    return df
+                df = df.rename(columns={'symbol': 'stock_code', 'date': 'datetime'})
+                df['datetime'] = pd.to_datetime(df['datetime'])
+                return df.set_index('datetime')
+
             # 确定表名
             table_map = {
                 '1d': 'stock_daily',
@@ -391,6 +386,77 @@ class UnifiedDataInterface:
             # 可能是表不存在或列不存在
             return None
 
+    def _read_from_online(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        period: str
+    ) -> Optional[pd.DataFrame]:
+        """通过统一DataAPI读取未复权行情，并归一为本接口的输出格式。"""
+        try:
+            api = self._get_online_data_api()
+            logger.debug(
+                f"    [DEBUG] _read_from_online: 开始获取 {stock_code} 数据...")
+            data = api.get_price(
+                codes=[stock_code],
+                start=start_date,
+                end=end_date,
+                period=period,
+                count=None,
+                fields=['open', 'high', 'low', 'close', 'volume', 'amount'],
+                adjust='none',
+            )
+
+            if data is None:
+                return None
+            if isinstance(data, dict):
+                data = data.get(stock_code)
+            if data is None or not isinstance(data, pd.DataFrame) or data.empty:
+                logger.warning("    [WARN] 在线数据源返回空数据")
+                return None
+            df = data.copy()
+            date_column = next(
+                (name for name in ('datetime', 'time', 'date') if name in df.columns),
+                None,
+            )
+            if date_column is not None:
+                raw_dates = df.pop(date_column)
+            else:
+                raw_dates = df.index
+            if pd.api.types.is_numeric_dtype(raw_dates):
+                numeric = pd.Series(raw_dates, copy=False)
+                largest = numeric.dropna().abs().max()
+                if largest <= 99_999_999:
+                    dates = pd.to_datetime(
+                        numeric.astype('Int64').astype(str),
+                        format='%Y%m%d', errors='coerce')
+                else:
+                    unit = 'ms' if largest > 10_000_000_000 else 's'
+                    dates = pd.to_datetime(raw_dates, unit=unit, errors='coerce')
+            else:
+                dates = pd.to_datetime(raw_dates, errors='coerce')
+            df.index = pd.DatetimeIndex(dates, name='datetime')
+            df = df[~df.index.isna()]
+            df.rename(
+                columns={'stock_code': 'code', 'symbol': 'code'}, inplace=True)
+            if 'code' not in df.columns:
+                df['code'] = stock_code
+            required = ['open', 'high', 'low', 'close', 'volume', 'amount']
+            for column in required:
+                if column not in df.columns:
+                    df[column] = np.nan
+            df = df[['code', *required]]
+            df.sort_index(inplace=True)
+            df = df[~df.index.duplicated(keep='last')]
+            logger.info(
+                f"    [OK] _read_from_online 完成，返回 {len(df)} 条记录")
+            return df
+
+        except Exception as e:
+            logger.error(f"  [ERROR] 在线数据获取失败: {e}")
+            return None
+
     def _read_from_qmt(
         self,
         stock_code: str,
@@ -398,100 +464,8 @@ class UnifiedDataInterface:
         end_date: str,
         period: str
     ) -> Optional[pd.DataFrame]:
-        """从QMT读取数据"""
-        try:
-            from xtquant import xtdata
-
-            logger.debug(f"    [DEBUG] _read_from_qmt: 开始获取 {stock_code} 数据...")
-
-            # 转换日期格式
-            start_str = start_date.replace('-', '')
-            end_str = end_date.replace('-', '')
-
-            # QMT的period参数：1d, 1m, 5m, tick 直接使用
-            qmt_period = period
-
-            logger.debug(f"    [DEBUG] 调用 download_history_data: {stock_code}, {qmt_period}, {start_str} ~ {end_str}")
-            # 下载历史数据
-            xtdata.download_history_data(
-                stock_code=stock_code,
-                period=qmt_period,
-                start_time=start_str,
-                end_time=end_str
-            )
-            logger.debug(f"    [DEBUG] download_history_data 完成")
-
-            # 获取数据
-            logger.debug(f"    [DEBUG] 调用 get_market_data...")
-            data = xtdata.get_market_data(
-                stock_list=[stock_code],
-                period=qmt_period,
-                start_time=start_str,
-                end_time=end_str,
-                count=0
-            )
-
-            if not data or 'time' not in data:
-                logger.warning(f"    [WARN] QMT返回数据为空或缺少time列")
-                return None
-
-            logger.debug(f"    [DEBUG] get_market_data 完成，数据keys: {list(data.keys())}")
-
-            # 转换为DataFrame
-            time_df = data['time']
-            timestamps = time_df.columns.tolist()
-
-            logger.debug(f"    [DEBUG] 开始解析 {len(timestamps)} 条时间戳...")
-
-            records = []
-            for idx, ts in enumerate(timestamps):
-                try:
-                    # 修复时区问题：明确处理时间戳转换
-                    if isinstance(ts, (int, float)) and ts > 1e10:  # 毫秒时间戳
-                        dt = pd.to_datetime(ts, unit='ms', utc=True).tz_convert('Asia/Shanghai')
-                    else:
-                        dt = pd.to_datetime(ts)
-                    records.append({
-                        'datetime': dt,
-                        'code': stock_code,
-                        'open': float(data['open'].iloc[0, idx]),
-                        'high': float(data['high'].iloc[0, idx]),
-                        'low': float(data['low'].iloc[0, idx]),
-                        'close': float(data['close'].iloc[0, idx]),
-                        'volume': float(data['volume'].iloc[0, idx]),
-                        'amount': float(data['amount'].iloc[0, idx])
-                    })
-                except Exception as e:
-                    logger.warning(f"    [WARN] 解析第{idx}条记录失败: {e}")
-                    continue
-
-            if not records:
-                logger.warning(f"    [WARN] 没有成功解析任何记录")
-                return None
-
-            logger.debug(f"    [DEBUG] 成功解析 {len(records)} 条记录")
-
-            df = pd.DataFrame(records)
-            df.set_index('datetime', inplace=True)
-            df.index.name = 'datetime'  # 明确命名索引
-            df.sort_index(inplace=True)
-
-            # 输出日期范围
-            if not df.empty:
-                logger.debug(f"    [DEBUG] QMT数据日期范围: {df.index.min()} ~ {df.index.max()}")
-
-            # 删除重复索引
-            df = df[~df.index.duplicated(keep='first')]
-
-            logger.info(f"    [OK] _read_from_qmt 完成，返回 {len(df)} 条记录")
-
-            return df
-
-        except Exception as e:
-            logger.error(f"  [ERROR] QMT 数据获取失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+        """兼容旧调用名；实际通过统一DataAPI路由读取。"""
+        return self._read_from_online(stock_code, start_date, end_date, period)
 
     def _get_dividends_from_qmt(
         self,

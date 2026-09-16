@@ -12,7 +12,7 @@ import struct
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 
 
@@ -24,9 +24,9 @@ class QMTLocalReader:
     性能提升：50-100倍
     """
 
-    # QMT 数据目录配置（支持大QMT和miniQMT）
-    DEFAULT_DATA_DIR = Path(r"D:/国金QMT交易端模拟/userdata_mini/datadir")
-    BIG_QMT_DATA_DIR = Path(r"D:/国金QMT交易端模拟/datadir")
+    # 兼容旧代码的默认值：实际路径由 data_manager.qmt_paths 按安装位置推导
+    DEFAULT_DATA_DIR = None
+    BIG_QMT_DATA_DIR = None
 
     # 大QMT文件命名后缀
     BIG_QMT_SUFFIX = "_9000"
@@ -44,11 +44,35 @@ class QMTLocalReader:
         '1M': '2592000',
     }
 
-    def __init__(self, data_dir: Optional[Path] = None):
-        """初始化读取器"""
-        self.data_dir = Path(data_dir) if data_dir else self.DEFAULT_DATA_DIR
-        if not self.data_dir.exists():
-            raise FileNotFoundError(f"QMT data directory not found: {self.data_dir}")
+    def __init__(self, data_dir: Optional[Path] = None,
+                 big_data_dir: Optional[Path] = None,
+                 require_exists: bool = True):
+        """初始化读取器
+
+        Args:
+            data_dir: miniQMT datadir；缺省从 data_manager.qmt_paths 推导
+            big_data_dir: 大QMT datadir；缺省同上推导
+            require_exists: 目录不存在时是否抛错（扫描型用途可传 False）
+        """
+        paths = self._resolve_default_paths()
+        resolved_mini = Path(data_dir) if data_dir else paths.get('datadir_mini')
+        resolved_big = Path(big_data_dir) if big_data_dir else paths.get('datadir_big')
+        self.data_dir = resolved_mini
+        self.big_data_dir = resolved_big
+        if require_exists and (not self.data_dir or not self.data_dir.exists()):
+            raise FileNotFoundError(
+                f"QMT data directory not found: {self.data_dir}"
+            )
+
+    @classmethod
+    def _resolve_default_paths(cls) -> Dict[str, Optional[Path]]:
+        """从 data_manager.qmt_paths 解析默认 datadir（避免硬编码安装路径）。"""
+        try:
+            from data_manager.qmt_paths import resolve_qmt_paths
+            return resolve_qmt_paths()
+        except Exception as e:
+            logger.warning(f"[WARNING] QMT 路径推导失败: {e}")
+            return {'datadir_mini': None, 'datadir_big': None}
 
     def get_file_path(self, stock_code: str, period: str,
                       prefer_big_qmt: bool = False) -> Optional[Path]:
@@ -73,11 +97,11 @@ class QMTLocalReader:
         if prefer_big_qmt:
             # 大QMT优先: datadir/market/{period_code}/{code}.DAT
             candidates.append(
-                self.BIG_QMT_DATA_DIR / market / period_code / f"{code}.DAT"
+                self.big_data_dir / market / period_code / f"{code}.DAT"
             )
             # 大QMT也兼容 market/0/{code}_9000.DAT 格式
             candidates.append(
-                self.BIG_QMT_DATA_DIR / market / '0' / f"{code}{self.BIG_QMT_SUFFIX}.DAT"
+                self.big_data_dir / market / '0' / f"{code}{self.BIG_QMT_SUFFIX}.DAT"
             )
             # 回退到 miniQMT
             candidates.append(
@@ -90,10 +114,10 @@ class QMTLocalReader:
             )
             # 回退到 大QMT
             candidates.append(
-                self.BIG_QMT_DATA_DIR / market / period_code / f"{code}.DAT"
+                self.big_data_dir / market / period_code / f"{code}.DAT"
             )
             candidates.append(
-                self.BIG_QMT_DATA_DIR / market / '0' / f"{code}{self.BIG_QMT_SUFFIX}.DAT"
+                self.big_data_dir / market / '0' / f"{code}{self.BIG_QMT_SUFFIX}.DAT"
             )
 
         # 兼容旧的日线目录格式
@@ -155,15 +179,19 @@ class QMTLocalReader:
             total_records = len(data) // rec_size
 
             records = []
+            # Keep the validity window current; the old 2026 cutoff silently
+            # discarded every newer trading day. Use UTC for the upper bound.
+            max_timestamp = (datetime.now(timezone.utc) + timedelta(days=1)).timestamp()
             for i in range(0, total_records, 2):  # 只取偶数索引
                 offset = i * rec_size
                 vals = struct.unpack_from('<IIIIIIII', data, offset)
                 ts = vals[0]
-                # 验证时间戳合理性 (1990-2026)
-                if not (631152000 < ts < 1767225600):
+                # Reject invalid dates without imposing a fixed expiry year.
+                if not (631152000 < ts <= max_timestamp):
                     continue
 
-                dt = datetime.fromtimestamp(ts)
+                # DAT trading dates must not depend on the reader host timezone.
+                dt = datetime.fromtimestamp(ts, timezone(timedelta(hours=8))).replace(tzinfo=None)
                 open_p = vals[1] / 1000.0
                 high_p = vals[2] / 1000.0
                 low_p = vals[3] / 1000.0
@@ -183,8 +211,12 @@ class QMTLocalReader:
                     'high': high_p,
                     'low': low_p,
                     'close': close_p,
-                    'volume': volume_lots * 100,  # 手转股
-                    'amount': 0,  # 日线格式不含成交额
+                    # stock_daily 的日线成交量统一以“手”为单位。DAT 的 vals[6]
+                    # 本身已经是手，不能再乘 100；下单数量才使用“股”。
+                    'volume': volume_lots,
+                    # This DAT layout does not expose a verified amount field.
+                    # Keep it unknown instead of manufacturing a zero turnover.
+                    'amount': None,
                 })
 
             if not records:
@@ -333,16 +365,18 @@ class QMTLocalReader:
 
         for mkt in markets:
             # 大QMT路径
-            big_dir = self.BIG_QMT_DATA_DIR / mkt / period_code
-            if big_dir.exists():
+            big_dir = (self.big_data_dir / mkt / period_code
+                       if self.big_data_dir else None)
+            if big_dir and big_dir.exists():
                 for f in big_dir.glob('*.DAT'):
                     code = f.stem
                     if code.isdigit():
                         stocks.append(f"{code}.{mkt}")
 
             # miniQMT路径
-            mini_dir = self.data_dir / mkt / period_code
-            if mini_dir.exists():
+            mini_dir = (self.data_dir / mkt / period_code
+                        if self.data_dir else None)
+            if mini_dir and mini_dir.exists():
                 for f in mini_dir.glob('*.DAT'):
                     code = f.stem
                     if code.isdigit():
@@ -355,23 +389,25 @@ class QMTLocalReader:
     def get_data_summary(self) -> Dict:
         """获取数据目录摘要信息"""
         summary = {
-            'big_qmt': {'path': str(self.BIG_QMT_DATA_DIR), 'exists': False, 'daily_count': 0},
+            'big_qmt': {'path': str(self.big_data_dir), 'exists': False, 'daily_count': 0},
             'mini_qmt': {'path': str(self.data_dir), 'exists': False, 'daily_count': 0},
         }
 
         # 大QMT
-        for mkt in ['SH', 'SZ']:
-            big_dir = self.BIG_QMT_DATA_DIR / mkt / '86400'
-            if big_dir.exists():
-                summary['big_qmt']['exists'] = True
-                summary['big_qmt'][f'{mkt}_count'] = len(list(big_dir.glob('*.DAT')))
+        if self.big_data_dir:
+            for mkt in ['SH', 'SZ']:
+                big_dir = self.big_data_dir / mkt / '86400'
+                if big_dir.exists():
+                    summary['big_qmt']['exists'] = True
+                    summary['big_qmt'][f'{mkt}_count'] = len(list(big_dir.glob('*.DAT')))
 
         # miniQMT
-        for mkt in ['SH', 'SZ']:
-            mini_dir = self.data_dir / mkt / '86400'
-            if mini_dir.exists():
-                summary['mini_qmt']['exists'] = True
-                summary['mini_qmt'][f'{mkt}_count'] = len(list(mini_dir.glob('*.DAT')))
+        if self.data_dir:
+            for mkt in ['SH', 'SZ']:
+                mini_dir = self.data_dir / mkt / '86400'
+                if mini_dir.exists():
+                    summary['mini_qmt']['exists'] = True
+                    summary['mini_qmt'][f'{mkt}_count'] = len(list(mini_dir.glob('*.DAT')))
 
         if summary['big_qmt']['exists']:
             sh = summary['big_qmt'].get('SH_count', 0)

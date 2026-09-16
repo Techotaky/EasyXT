@@ -125,7 +125,8 @@ data/
 qlib_data/
 easyxt_backtest/ml/models/
 logs/
-*.csv
+# 根目录临时导出仍忽略；子目录CSV由各自目录规则控制，允许提交fixture/清单。
+/*.csv
 *.xlsx
 *.xls
 
@@ -181,7 +182,6 @@ xtquant/
 # Tushare基础数据下载模块（重要，GUI依赖）
 !tushare_manager/download_basic_data.py
 
-*test*.py
 *debug*.py
 *fix*.py
 create_*.py
@@ -216,11 +216,12 @@ test_qmt*.py
 qmt_test*.py
 *_test_qmt*.py
 example*.py
-simple_*.py
-verify_*.py
-check_*.py
-compare_*.py
 comprehensive_*.py
+
+# 正式单元测试必须可追踪；保留上述规则对散落的临时脚本生效
+!unit_tests/
+!unit_tests/**/
+!unit_tests/**/*.py
 
 # ==================== 例外规则：保留重要文件 ====================
 # Alpha分析平台的核心文件
@@ -303,14 +304,9 @@ easy_xt/realtime_data/config/server_config.json
 examples/
 backup/
 integration_test_logs/
-logs/
 reports/
-tests/
 .worktrees/
 demo*/
-
-# 保留正式的单元测试目录
-!unit_tests/**/*.py
 
 # Demo图表文件
 demo_*.png
@@ -393,16 +389,11 @@ strategies/quant_strategies/
 
 # 数据验证和分析脚本（临时文件，不提交）
 diagnose_*.py
-compare_*.py
-check_*.py
-verify_*.py
 docs/market_cap_data_analysis.md
 docs/*数据*.md
 easyxt_backtest/README_V2.md
 easyxt_backtest/README_V3.md
 .archive/README.md
-101因子/101因子分析平台/scripts/test_datasource.py
-101因子/101因子分析平台/scripts/test_datasource.py
 101因子/101因子分析平台/scripts/test_datasource.py
 code_converter/utils/qmt_api_scraper.py
 
@@ -440,7 +431,6 @@ tushare_skills_charts/
 
 # AI助手生成的数据文件
 maotai_daily_*.csv
-*.csv
 
 # AI助手临时文件
 一键复制推文.py
@@ -481,7 +471,6 @@ userswukunappdatalocaltempeasyxt_test/
 docs/manual/
 
 # AI助手生成的内容（公众号推文等，不提交到 GitHub）
-docs/王者quant 公众号文章/
 docs/王者quant策略工坊/
 
 # 知乎运营内容（不提交到 GitHub）

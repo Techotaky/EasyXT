@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 import pandas as pd
 from typing import Callable, List, Dict, Optional
+from config.env_config import get_default_db_path
 from .strategy_base import StrategyBase
 
 
@@ -34,6 +35,7 @@ class SimpleFunctionAdapter(StrategyBase):
                  data_manager=None,
                  category: str = 'stock',
                  adjust: str = 'none',
+                 db_path: Optional[str] = None,
                  **extra_kwargs):
         super().__init__(data_manager)
         self.func = func
@@ -44,6 +46,8 @@ class SimpleFunctionAdapter(StrategyBase):
         self._extra = extra_kwargs
         self.category = category
         self.adjust = adjust  # 复权类型（仅 stock 类别使用）
+        # 与 GUI/Tushare 下载器共享同一默认数据库；调用方也可显式指定快照。
+        self._db_path = str(db_path or get_default_db_path())
 
         # 预加载并缓存该类别的全部日线数据（供选股和价格查询共用）
         self._category_data: Optional[pd.DataFrame] = None
@@ -61,7 +65,7 @@ class SimpleFunctionAdapter(StrategyBase):
             return
 
         import duckdb
-        db_path = 'D:/StockData/stock_data.ddb'
+        db_path = self._db_path
 
         # YYYYMMDD → YYYY-MM-DD
         if len(self._start) == 8 and self._start.isdigit():
@@ -108,7 +112,13 @@ class SimpleFunctionAdapter(StrategyBase):
                 if self.adjust != 'none':
                     # 后复权：adj_close = close / factor_today * factor_latest（复用股票 adj_factor 表）
                     query = f"""
-                        SELECT e.ts_code, e.trade_date, e.open, e.high, e.low,
+                        SELECT e.ts_code, e.trade_date,
+                               e.open / COALESCE(f_today.adj_factor, 1.0)
+                                      * COALESCE(f_latest.adj_factor, 1.0) AS open,
+                               e.high / COALESCE(f_today.adj_factor, 1.0)
+                                      * COALESCE(f_latest.adj_factor, 1.0) AS high,
+                               e.low / COALESCE(f_today.adj_factor, 1.0)
+                                     * COALESCE(f_latest.adj_factor, 1.0) AS low,
                                e.close / COALESCE(f_today.adj_factor, 1.0)
                                       * COALESCE(f_latest.adj_factor, 1.0) AS close,
                                e.vol, e.amount, e.pct_chg
@@ -206,13 +216,34 @@ class SimpleFunctionAdapter(StrategyBase):
 
         return {}
 
+    def get_open_prices_for_date(self, symbols: List[str], date: str) -> Dict[str, float]:
+        """批量查询多个标的在某日的开盘价，供 T+1 成交使用。"""
+        if self._category_data is not None and not self._category_data.empty:
+            date_dt = self._date_to_ts(date)
+            day_data = self._category_data[
+                (self._category_data['trade_date'] == date_dt) &
+                (self._category_data['ts_code'].isin(symbols))
+            ]
+            if 'open' not in day_data.columns:
+                return {}
+            return dict(zip(day_data['ts_code'], day_data['open'].astype(float)))
+
+        if self.category == 'stock':
+            batch = self._query_stock_prices_batch(symbols, date, date)
+            result = {}
+            for symbol, frame in batch.items():
+                if frame is not None and not frame.empty and 'open' in frame.columns:
+                    result[symbol] = float(frame['open'].iloc[-1])
+            return result
+        return {}
+
     def _query_stock_prices_for_date(self, symbols: List[str], date: str) -> Dict[str, float]:
         """直连 DuckDB 批量查询当日股票收盘价（IN 子句，支持后复权）"""
         import duckdb
         date_fmt = self._norm_date(date)
         con = None
         try:
-            con = duckdb.connect('D:/StockData/stock_data.ddb', read_only=True)
+            con = duckdb.connect(self._db_path, read_only=True)
             clean_codes = [s.replace('.SZ', '').replace('.SH', '') for s in symbols]
             all_codes = list(set(symbols + clean_codes))
             in_clause = ','.join(f"'{c}'" for c in all_codes)
@@ -303,7 +334,7 @@ class SimpleFunctionAdapter(StrategyBase):
         date_fmt = self._norm_date(date)
         con = None
         try:
-            con = duckdb.connect('D:/StockData/stock_data.ddb', read_only=True)
+            con = duckdb.connect(self._db_path, read_only=True)
             code_clean = symbol.replace('.SZ', '').replace('.SH', '')
 
             if self.adjust != 'none':
@@ -400,7 +431,7 @@ class SimpleFunctionAdapter(StrategyBase):
         con = None
         result = {}
         try:
-            con = duckdb.connect('D:/StockData/stock_data.ddb', read_only=True)
+            con = duckdb.connect(self._db_path, read_only=True)
             for symbol in symbols:
                 code_clean = symbol.replace('.SZ', '').replace('.SH', '')
 
@@ -408,7 +439,12 @@ class SimpleFunctionAdapter(StrategyBase):
                     # 后复权：adj_close = close / factor_today * factor_latest
                     df = con.execute(f"""
                         SELECT s.stock_code AS ts_code, s.date AS trade_date,
-                               s.open, s.high, s.low,
+                               s.open / COALESCE(f_today.adj_factor, 1.0)
+                                      * COALESCE(f_latest.adj_factor, 1.0) AS open,
+                               s.high / COALESCE(f_today.adj_factor, 1.0)
+                                      * COALESCE(f_latest.adj_factor, 1.0) AS high,
+                               s.low / COALESCE(f_today.adj_factor, 1.0)
+                                     * COALESCE(f_latest.adj_factor, 1.0) AS low,
                                s.close / COALESCE(f_today.adj_factor, 1.0)
                                       * COALESCE(f_latest.adj_factor, 1.0) AS close,
                                s.volume, s.amount
@@ -498,7 +534,7 @@ class SimpleFunctionAdapter(StrategyBase):
         date_fmt = self._norm_date(date)
         con = None
         try:
-            con = duckdb.connect('D:/StockData/stock_data.ddb', read_only=True)
+            con = duckdb.connect(self._db_path, read_only=True)
             df = con.execute(f"""
                 SELECT stock_code AS ts_code, date AS trade_date,
                        close,
@@ -552,7 +588,7 @@ class SimpleFunctionAdapter(StrategyBase):
         """
         import duckdb
         try:
-            db_path = 'D:/StockData/stock_data.ddb'
+            db_path = self._db_path
             con = duckdb.connect(db_path, read_only=True)
             exists = con.execute(
                 "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'cb_call'"
@@ -611,7 +647,7 @@ class SimpleFunctionAdapter(StrategyBase):
         """
         import duckdb
         try:
-            db_path = 'D:/StockData/stock_data.ddb'
+            db_path = self._db_path
             con = duckdb.connect(db_path, read_only=True)
             exists = con.execute(
                 "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'cb_share'"

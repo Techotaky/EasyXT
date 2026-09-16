@@ -14,11 +14,14 @@ import os
 from pathlib import Path
 import pandas as pd
 import numpy as np
+from .metrics import DEFAULT_RISK_FREE_RATE, annualized_return, annualized_sharpe
 from typing import Callable, Dict, Any, List, Optional
 from easyxt_backtest.research.universe import universe_as_of
 from easyxt_backtest.research.audit import build_experiment_manifest
 
-DB_PATH = 'D:/StockData/stock_data.ddb'
+from config.env_config import get_default_db_path
+
+DB_PATH = get_default_db_path()
 DATA_MODE_DUCKDB_ONLY = 'duckdb_only'
 
 # 各类资产配置
@@ -105,6 +108,7 @@ class VectorizedBacktestEngine:
         universe_history: Optional[pd.DataFrame] = None,
         data_snapshot: str = "unversioned",
         universe_version: str = "data_default",
+        risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
         **strategy_kwargs
     ) -> Dict[str, Any]:
         """
@@ -224,10 +228,13 @@ class VectorizedBacktestEngine:
                 'total_value': close_total_value, 'num_holdings': len(holdings)
             })
 
-        result = self._build_result(nav_list, trades, holdings_history, initial_cash)
+        result = self._build_result(
+            nav_list, trades, holdings_history, initial_cash, risk_free_rate
+        )
         result.setdefault('parameters', {})['signal_timing'] = 'close_to_next_open'
         result['parameters']['signal_lag_days'] = signal_lag_days
         result['parameters']['commission'] = commission
+        result['parameters']['risk_free_rate'] = risk_free_rate
         result['parameters']['slippage_bps'] = slippage_bps
         result['parameters']['max_participation_rate'] = max_participation_rate
         result['parameters']['universe_mode'] = 'point_in_time' if universe_history is not None else 'data_default'
@@ -368,6 +375,9 @@ class VectorizedBacktestEngine:
             import requests
             session = requests.Session()
             session.trust_env = False
+            token = os.environ.get("EASYXT_DATA_SERVICE_TOKEN", "").strip()
+            if token:
+                session.headers["Authorization"] = f"Bearer {token}"
             url = f"http://{host}:{port}/daily/{self.category}"
             resp = session.get(
                 url,
@@ -540,6 +550,9 @@ class VectorizedBacktestEngine:
         import requests
         session = requests.Session()
         session.trust_env = False
+        token = os.environ.get("EASYXT_DATA_SERVICE_TOKEN", "").strip()
+        if token:
+            session.headers["Authorization"] = f"Bearer {token}"
         response = session.get(
             f"http://{host}:{port}/events/cb",
             params={"start_time": "19000101", "end_time": "29991231"},
@@ -599,7 +612,8 @@ class VectorizedBacktestEngine:
 
     def _build_result(self, nav_list: list, trades: list,
                       holdings_history: list,
-                      initial_cash: float) -> Dict[str, Any]:
+                      initial_cash: float,
+                      risk_free_rate: float = DEFAULT_RISK_FREE_RATE) -> Dict[str, Any]:
         nav_df = pd.DataFrame(nav_list)
         if nav_df.empty:
             return self._empty_result()
@@ -609,28 +623,27 @@ class VectorizedBacktestEngine:
 
         return {
             'nav_curve': nav_df,
-            'metrics': self._calc_metrics(nav_df, initial_cash),
+            'metrics': self._calc_metrics(nav_df, initial_cash, risk_free_rate),
             'holdings_history': holdings_history,
             'trades': trades,
         }
 
     @staticmethod
-    def _calc_metrics(nav_df: pd.DataFrame, initial_cash: float) -> dict:
+    def _calc_metrics(nav_df: pd.DataFrame, initial_cash: float,
+                      risk_free_rate: float = DEFAULT_RISK_FREE_RATE) -> dict:
         if nav_df.empty or len(nav_df) < 2:
             return {}
 
         total_days = len(nav_df)
         final_nav = nav_df['nav'].iloc[-1]
         total_return = final_nav - 1
-        annual_return = (1 + total_return) ** (252 / max(total_days, 1)) - 1
+        annual_return = annualized_return(total_return, total_days)
 
         cummax = nav_df['nav'].cummax()
         drawdown = (nav_df['nav'] - cummax) / cummax
         max_drawdown = drawdown.min()
 
-        daily_std = nav_df['daily_return'].std()
-        sharpe = (nav_df['daily_return'].mean() / daily_std * np.sqrt(252)) \
-            if daily_std > 0 else 0
+        sharpe = annualized_sharpe(nav_df['daily_return'], risk_free_rate)
 
         calmar = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0
         win_rate = (nav_df['daily_return'] > 0).sum() / total_days

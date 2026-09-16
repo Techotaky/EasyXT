@@ -36,6 +36,7 @@ except ImportError as e:
 
 from .utils import StockCodeUtils, ErrorHandler
 from .config import config
+from .trade_api import TradeAPI
 
 class AdvancedCallback:
     """高级交易回调类"""
@@ -61,6 +62,8 @@ class AdvancedCallback:
         # 事件通知
         self.order_event = Event()
         self.trade_event = Event()
+        self.async_order_event = Event()
+        self.async_order_responses = {}
         
     def set_callbacks(self, order_callback=None, trade_callback=None, error_callback=None):
         """设置用户回调函数"""
@@ -101,6 +104,11 @@ class AdvancedCallback:
                 self.trade_callback(trade)
             except Exception as e:
                 logger.info(f"用户成交回调异常: {e}")
+
+    def on_order_stock_async_response(self, response):
+        """Record the response associated with an async order request sequence."""
+        self.async_order_responses[response.seq] = response
+        self.async_order_event.set()
         
     def on_stock_position(self, position):
         """持仓回调"""
@@ -214,7 +222,8 @@ class AdvancedTradeAPI:
             result = self.trader.subscribe(account)
             if result == 0:
                 self.accounts[account_id] = account
-                logger.info(f"高级交易账户 {account_id} 添加成功")
+                masked_account = '*' * max(0, len(account_id) - 4) + account_id[-4:]
+                logger.info(f"高级交易账户 {masked_account} 添加成功")
                 return True
             else:
                 ErrorHandler.log_error(f"订阅高级交易账户失败，错误码: {result}")
@@ -257,11 +266,35 @@ class AdvancedTradeAPI:
             'valid': len(reasons) == 0,
             'reasons': reasons
         }
+
+    @staticmethod
+    def _normalize_and_validate_order(
+        order_type: str,
+        volume: int,
+        price: float,
+        price_type: str,
+    ) -> str:
+        """Validate an advanced order before it can reach ``XtQuantTrader``."""
+        normalized_order_types = {
+            'buy': 'buy',
+            '买入': 'buy',
+            'sell': 'sell',
+            '卖出': 'sell',
+        }
+        normalized_order_type = normalized_order_types.get(order_type)
+        if normalized_order_type is None:
+            raise ValueError(f"不支持的 order_type: {order_type}")
+
+        TradeAPI._validate_order_params(volume, price, price_type)
+        return normalized_order_type
     
     def sync_order(self, account_id: str, code: str, order_type: str, volume: int, 
                    price: float = 0, price_type: str = 'market', 
                    strategy_name: str = 'EasyXT', order_remark: str = '') -> Optional[int]:
         """同步下单"""
+        order_type = self._normalize_and_validate_order(
+            order_type, volume, price, price_type
+        )
         if not self.trader or account_id not in self.accounts:
             ErrorHandler.log_error("高级交易服务未连接或账户未添加")
             return None
@@ -278,8 +311,13 @@ class AdvancedTradeAPI:
             '限价': xt_const.FIX_PRICE if xt_const else 11
         }
         
-        xt_price_type = price_type_map.get(price_type, xt_const.LATEST_PRICE if xt_const else 5)
-        xt_order_type = xt_const.STOCK_BUY if xt_const and order_type == 'buy' else xt_const.STOCK_SELL if xt_const else 24
+        xt_price_type = price_type_map[price_type]
+        if xt_const:
+            xt_order_type = (
+                xt_const.STOCK_BUY if order_type == 'buy' else xt_const.STOCK_SELL
+            )
+        else:
+            xt_order_type = 23 if order_type == 'buy' else 24
         
         try:
             order_id = self.trader.order_stock(
@@ -308,6 +346,9 @@ class AdvancedTradeAPI:
                     price: float = 0, price_type: str = 'market',
                     strategy_name: str = 'EasyXT', order_remark: str = '') -> bool:
         """异步下单 - 真正的异步方式，不等待结果，通过回调处理"""
+        order_type = self._normalize_and_validate_order(
+            order_type, volume, price, price_type
+        )
         if not self.trader or account_id not in self.accounts:
             ErrorHandler.log_error("高级交易服务未连接或账户未添加")
             return False
@@ -323,12 +364,17 @@ class AdvancedTradeAPI:
             '限价': xt_const.FIX_PRICE if xt_const else 11
         }
         
-        xt_price_type = price_type_map.get(price_type, xt_const.LATEST_PRICE if xt_const else 5)
-        xt_order_type = xt_const.STOCK_BUY if xt_const and order_type == 'buy' else xt_const.STOCK_SELL if xt_const else 24
+        xt_price_type = price_type_map[price_type]
+        if xt_const:
+            xt_order_type = (
+                xt_const.STOCK_BUY if order_type == 'buy' else xt_const.STOCK_SELL
+            )
+        else:
+            xt_order_type = 23 if order_type == 'buy' else 24
         
         try:
-            # 发送下单请求后立即返回，不等待结果
-            order_id = self.trader.order_stock(
+            # 使用 XtQuantTrader 的真实异步接口，返回请求序号而非委托号。
+            request_seq = self.trader.order_stock_async(
                 account=account,
                 stock_code=code,
                 order_type=xt_order_type,
@@ -338,10 +384,18 @@ class AdvancedTradeAPI:
                 strategy_name=strategy_name,
                 order_remark=order_remark or f'{order_type}_{code}'
             )
-            
-            # 立即返回True表示请求已发送（不表示执行成功）
-            logger.info(f"异步下单请求已发送: {code}, 数量: {volume}, 序列号: {order_id}")
-            return True
+
+            # 大于 0 表示请求已被接受；最终委托结果仍以异步回调为准。
+            if isinstance(request_seq, int) and not isinstance(request_seq, bool) and request_seq > 0:
+                logger.info(
+                    f"异步下单请求已接受: {code}, 数量: {volume}, 请求序号: {request_seq}"
+                )
+                return True
+
+            ErrorHandler.log_error(
+                f"异步下单请求未被接受: {code}, 返回值: {request_seq}"
+            )
+            return False
             
         except Exception as e:
             ErrorHandler.log_error(f"异步下单请求失败: {str(e)}")

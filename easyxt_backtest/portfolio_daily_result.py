@@ -4,10 +4,16 @@
 
 参考vnpy的设计，实现逐日盯市的盈亏计算。
 """
-from typing import Dict, List
+from typing import Dict, List, Optional
 from datetime import date, datetime
 from dataclasses import dataclass, field
 import pandas as pd
+from .metrics import (
+    DEFAULT_RISK_FREE_RATE,
+    TRADING_DAYS_PER_YEAR,
+    annualized_return,
+    annualized_sharpe,
+)
 
 
 @dataclass
@@ -18,7 +24,7 @@ class TradeRecord:
     volume: float
     price: float
     datetime: datetime
-    commission: float = 0.0
+    commission: Optional[float] = None
 
 
 @dataclass
@@ -123,7 +129,11 @@ class PortfolioDailyResult:
             self.turnover += trade_turnover
 
             # 计算手续费
-            trade_commission = trade_turnover * commission_rate
+            trade_commission = (
+                trade.commission
+                if trade.commission is not None
+                else trade_turnover * commission_rate
+            )
             self.commission += trade_commission
 
             # 更新持仓
@@ -237,7 +247,12 @@ class DailyResultManager:
 
         return df
 
-    def calculate_statistics(self, daily_df: pd.DataFrame, annual_days: int = 240) -> Dict:
+    def calculate_statistics(
+        self,
+        daily_df: pd.DataFrame,
+        annual_days: int = TRADING_DAYS_PER_YEAR,
+        risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+    ) -> Dict:
         """
         计算统计指标
 
@@ -278,17 +293,19 @@ class DailyResultManager:
         # 收益率
         total_net_pnl = daily_df['net_pnl'].sum()
         total_return = (end_balance / self.initial_cash - 1) * 100
-        annual_return = total_return / total_days * annual_days
+        annual_return = annualized_return(
+            total_return / 100,
+            total_days,
+            annual_days,
+        ) * 100
 
         # 波动率和夏普比率
         daily_returns = daily_df['balance'].pct_change().dropna()
-        daily_return_mean = daily_returns.mean() * 100
-        return_std = daily_returns.std() * 100
-
-        if return_std > 0:
-            sharpe_ratio = daily_return_mean / return_std * (annual_days ** 0.5)
-        else:
-            sharpe_ratio = 0.0
+        sharpe_ratio = annualized_sharpe(
+            daily_returns,
+            risk_free_rate,
+            annual_days,
+        )
 
         # 收益回撤比
         if max_drawdown != 0:

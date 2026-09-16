@@ -125,14 +125,14 @@ python tools/setup_duckdb.py
 
 ### 📂 不确定路径配置？
 
-→ 📁 **[路径配置指南](PATH_GUIDE.md)** ← **新手必读！**
+→ 📁 **[路径配置指南](docs/SETUP_GUIDE.md#15-qmt-路径配置)** ← **新手必读！**
 - 什么是"项目根目录"？
 - 从 GitHub 下载后文件夹是什么名字？
 - 如何正确配置路径？
 
 ### 🏗️ 我想了解系统架构
 
-→ 📐 **[系统架构文档 (ARCHITECTURE)](ARCHITECTURE.md)** - 了解项目整体设计、模块关系和技术选型
+→ 📐 **[系统架构文档 (ARCHITECTURE)](docs/ARCHITECTURE.md)** - 了解项目整体设计、模块关系和技术选型
 
 ---
 
@@ -279,7 +279,6 @@ api.buy(account_id='xxx', code='600000.SH', volume=100, price=12.5)
 
 ### 📖 相关文档
 
-- [📢 听说miniQMT要关停，别慌！EasyXT已全面支持大QMT](docs/公众号推文_听说miniqmt要关停别慌EasyXT已全面支持大QMT.md)
 - [📖 QMT版本说明](docs/assets/QMT_VERSIONS.md)
 - [📖 QMT自动登录](docs/assets/QMT_AUTOLOGIN_SECTION.md)
 
@@ -299,10 +298,15 @@ EasyXT/                          # 项目根目录（从 GitHub 下载后的文�
 │   ├── advanced_trade_api.py  # 高级交易接口
 │   └── utils.py               # 工具函数
 ├── easyxt_backtest/           # 回测框架
-│   ├── data_manager.py        # 数据管理器
-│   ├── engine.py              # 回测引擎
+│   ├── enhanced_backtest_engine.py  # 事件驱动回测引擎
+│   ├── vectorized_engine.py   # 向量化回测引擎
+│   ├── metrics.py             # 统一绩效指标
 │   ├── performance.py         # 性能分析
 │   └── strategies/            # 策略实现
+├── core/data_manager/         # 回测与研究共用的数据管理器
+│   ├── hybrid_manager.py      # 多数据源管理
+│   ├── local_price_reader.py  # 规范化本地日线读取
+│   └── sources/               # DuckDB/QMT/Tushare/BaoStock适配器
 ├── 101因子/                    # 因子分析平台
 │   └── 101因子分析平台/       # Streamlit应用
 ├── strategies/                 # 策略集合
@@ -516,6 +520,16 @@ data = api.get_price('000001.SZ', count=100)
 print(data.head())
 ```
 
+分钟K线（`1m`、`5m`、`15m`、`30m`）首次读取会先查 QMT 本地缓存；
+缓存为空时，指定 `start`/`end` 的查询会按该日期范围请求下载，不再固定为最近三天。
+使用 `count` 时会按周期和条数估算包含周末的下载窗口；不指定日期或条数时默认请求最近十个自然日。
+窗口是下载请求范围，不保证 QMT 上游一定有足够的K线；下载后若仍为空，错误会写明实际请求区间。
+
+```python
+bars = api.get_price('002714.SZ', period='1m', count=100)
+history = api.get_price('002714.SZ', start='20260901', end='20260914', period='1m')
+```
+
 #### 简单交易示例
 
 ```python
@@ -578,10 +592,10 @@ gui_app/main_window.py
 ## ⚙️ 安装指南
 
 > 📖 **安装文档**：
-> - **[INSTALL.md](INSTALL.md)** - 快速安装指南
-> - **[SETUP_GUIDE.md](SETUP_GUIDE.md)** - 🆕 增强版配置指南（包含详细的 xtquant、数据源、IDE 配置说明）
+> - **[INSTALL.md](docs/INSTALL.md)** - 快速安装指南
+> - **[SETUP_GUIDE.md](docs/SETUP_GUIDE.md)** - 🆕 增强版配置指南（包含详细的 xtquant、数据源、IDE 配置说明）
 >
-> ⚠️ **遇到 `cannot import name 'datacenter' from 'xtquant'` 错误？** 查看 [SETUP_GUIDE.md - xtquant 配置](SETUP_GUIDE.md#1-xtquant-配置)
+> ⚠️ **遇到 `cannot import name 'datacenter' from 'xtquant'` 错误？** 查看 [SETUP_GUIDE.md - xtquant 配置](docs/SETUP_GUIDE.md#15-qmt-路径配置)
 
 ### 环境要求
 
@@ -684,10 +698,10 @@ python -c "from easy_xt import get_api; print('✓ 安装成功')"
 ```bash
 # 如果需要回测功能，将项目路径添加到 PYTHONPATH
 # PowerShell:
-$env:PYTHONPATH += ";C:\Users\Administrator\EasyXT"
+$env:PYTHONPATH += ";$PWD"
 
 # 或永久添加：
-[System.Environment]::SetEnvironmentVariable("PYTHONPATH", "C:\Users\Administrator\EasyXT", "User")
+[System.Environment]::SetEnvironmentVariable("PYTHONPATH", "$PWD", "User")
 
 # 如果需要因子平台
 cd 101因子/101因子分析平台
@@ -708,10 +722,10 @@ pip install pywinauto pyautogui
 
 2. 编辑 `.env` 文件，填写QMT登录信息：
    ```env
-   QMT_EXE_PATH=D:\国金QMT交易端模拟\bin.x64\XtMiniQmt.exe
+   QMT_EXE_PATH=D:/QMT交易端/bin.x64/XtMiniQmt.exe
    QMT_USER_ID=8888499999
    QMT_PASSWORD=your_password
-   QMT_DATA_DIR=D:\国金QMT交易端模拟\userdata_mini
+   QMT_DATA_DIR=D:/QMT交易端/userdata_mini
    ```
 
 3. 运行自动登录：
@@ -774,7 +788,7 @@ python -c "import easyxt_backtest; print('✓ easyxt_backtest OK')"
 python -c "from dotenv import load_dotenv; load_dotenv(); import os; print('✓ Tushare Token:', os.getenv('TUSHARE_TOKEN')[:10] + '...') if os.getenv('TUSHARE_TOKEN') else print('✗ Token未配置')"
 ```
 
-**如果第 1 步报错**（`cannot import name 'datacenter' from 'xtquant'`），请查看 **[SETUP_GUIDE.md - xtquant 配置](SETUP_GUIDE.md#1-xtquant-配置)** 获取详细解决方案。
+**如果第 1 步报错**（`cannot import name 'datacenter' from 'xtquant'`），请查看 **[SETUP_GUIDE.md - xtquant 配置](docs/SETUP_GUIDE.md#15-qmt-路径配置)** 获取详细解决方案。
 
 ---
 
